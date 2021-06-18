@@ -7,6 +7,7 @@
 -   Added a simple web interface
 -   Using Kalman filter for the humidity measurements, my DHT22 are quite noisy 
 -   Blinking the onboard LED of the NodeMCU V2 to indicate new measurement being transmitted
+-   No motion sensor
 
 Below is the original documentation, I am not changing it for now. 
 
