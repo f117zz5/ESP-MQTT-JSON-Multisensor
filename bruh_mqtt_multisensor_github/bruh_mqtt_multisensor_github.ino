@@ -15,11 +15,14 @@
         - Next, download the ESP8266 dependancies by going to Tools -> Board -> Board Manager and searching for ESP8266 and installing it.
   
   - You will also need to download the follow libraries by going to Sketch -> Include Libraries -> Manage Libraries
-      - DHT sensor library 
-      - Adafruit unified sensor
-      - PubSubClient
-      - ArduinoJSON
-	  
+  - DHT sensor library (Ver 1.3.0, 1.3.4 was not working)
+  - Adafruit unified sensor (Ver 1.0.3)
+  - PubSubClient (Ver 2.7.0)
+  - ArduinoJSON (Ver 5.13.5)
+  - Kalman Lib (https://github.com/bachagas/Kalman)
+  - TaskScheduler (Ver 3.0.2)
+  
+
   UPDATE 16 MAY 2017 by Knutella - Fixed MQTT disconnects when wifi drops by moving around Reconnect and adding a software reset of MCU
 	           
   UPDATE 23 MAY 2017 - The MQTT_MAX_PACKET_SIZE parameter may not be setting appropriately due to a bug in the PubSub library. If the MQTT messages are not being transmitted as expected you may need to change the MQTT_MAX_PACKET_SIZE parameter in "PubSubClient.h" directly.
@@ -31,16 +34,18 @@
 
 
 #include <ESP8266WiFi.h>
-#include <DHT.h>
+#include <ESP8266WiFiMulti.h>   // Include the Wi-Fi-Multi library. Example from here: https://tttapa.github.io/ESP8266/Chap07%20-%20Wi-Fi%20Connections.html
+#include <DHT_U.h>
 #include <PubSubClient.h>
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
+#include <Kalman.h>
+#include <ESP8266WebServer.h>   // Include the WebServer library
+#include <TaskScheduler.h>
 
 
-/************ TEMP SETTINGS (CHANGE THIS FOR YOUR SETUP) *******************************/
-#define IsFahrenheit true //to use celsius change to false
 
 /************ WIFI and MQTT INFORMATION (CHANGE THESE FOR YOUR SETUP) ******************/
 #define wifi_ssid "YourSSID" //type your WIFI information inside the quotes
@@ -53,13 +58,21 @@
 
 
 /************* MQTT TOPICS (change these topics as you wish)  **************************/
-#define light_state_topic "bruh/sensornode1"
-#define light_set_topic "bruh/sensornode1/set"
+String light_state_topic;
 
-const char* on_cmd = "ON";
-const char* off_cmd = "OFF";
+//#define light_set_topic "esp8266/01/set"
+String ChipID;
 
 
+
+/**************************** FOR TaskScheduler ****************************************/
+void readDHT();
+void checkNewValues();
+
+Task t_readDHT(2500, TASK_FOREVER, &readDHT);
+Task t_checkNewValues(2500, TASK_FOREVER, &checkNewValues);
+
+Scheduler runner;
 
 /**************************** FOR OTA **************************************************/
 #define SENSORNAME "sensornode1"
@@ -69,10 +82,8 @@ int OTAport = 8266;
 
 
 /**************************** PIN DEFINITIONS ********************************************/
-const int redPin = D1;
-const int greenPin = D2;
-const int bluePin = D3;
-#define PIRPIN    D5
+
+
 #define DHTPIN    D7
 #define DHTTYPE   DHT22
 #define LDRPIN    A0
@@ -81,72 +92,61 @@ const int bluePin = D3;
 
 /**************************** SENSOR DEFINITIONS *******************************************/
 float ldrValue;
-int LDR;
+int LDR = 0;
 float calcLDR;
 float diffLDR = 25;
 
 float diffTEMP = 0.2;
 float tempValue;
 
-float diffHUM = 1;
+float diffHUM = 0.5;
 float humValue;
+float humValue_Kalman;
 
-int pirValue;
-int pirStatus;
-String motionStatus;
+float newTempValue;
+float newHumValue;
+float newHumValue_Kalman;
 
 char message_buff[100];
 
-int calibrationTime = 0;
+int calibrationTime = 5;
 
 const int BUFFER_SIZE = 300;
 
-#define MQTT_MAX_PACKET_SIZE 512
+//#define MQTT_MAX_PACKET_SIZE 512
 
-
-/******************************** GLOBALS for fade/flash *******************************/
-byte red = 255;
-byte green = 255;
-byte blue = 255;
-byte brightness = 255;
-
-byte realRed = 0;
-byte realGreen = 0;
-byte realBlue = 0;
-
-bool stateOn = false;
-
-bool startFade = false;
-unsigned long lastLoop = 0;
-int transitionTime = 0;
-bool inFade = false;
-int loopCount = 0;
-int stepR, stepG, stepB;
-int redVal, grnVal, bluVal;
-
-bool flash = false;
-bool startFlash = false;
-int flashLength = 0;
-unsigned long flashStartTime = 0;
-byte flashRed = red;
-byte flashGreen = green;
-byte flashBlue = blue;
-byte flashBrightness = brightness;
-
+bool SendMQTT = false;
+bool DHT22_read_OK = false;
 
 
 WiFiClient espClient;
+ESP8266WiFiMulti wifiMulti;     // Create an instance of the ESP8266WiFiMulti class, called 'wifiMulti
 PubSubClient client(espClient);
-DHT dht(DHTPIN, DHTTYPE);
+DHT_Unified dht(DHTPIN, DHTTYPE);
+//https://www.arduino.cc/en/Reference/WiFiMACAddress
+byte mac[6];                     // the MAC address of your Wifi shield
+int SendCounter = 0;
 
+// create the Kalman filter
+Kalman myFilter(0.125, 32, 1023, 0); //suggested initial values for high noise filtering
+
+// WEb server, example from https://tttapa.github.io/ESP8266/Chap10%20-%20Simple%20Web%20Server.html
+ESP8266WebServer server(80);    // Create a webserver object that listens for HTTP request on port 80
+void handleRoot();              // function prototypes for HTTP handlers
+void handleNotFound();
 
 
 /********************************** START SETUP*****************************************/
 void setup() {
 
+  //testing the blink led 
+  // example here: https://lowvoltage.github.io/2017/07/09/Onboard-LEDs-NodeMCU-Got-Two
+  pinMode(LED_BUILTIN, OUTPUT);
+  String MDNS_String;
   Serial.begin(115200);
+  Serial.println("Booting...");
 
-  pinMode(PIRPIN, INPUT);
+
   pinMode(DHTPIN, INPUT);
   pinMode(LDRPIN, INPUT);
 
@@ -168,10 +168,12 @@ void setup() {
   Serial.println("Starting Node named " + String(SENSORNAME));
 
 
-  setup_wifi();
+  //setup_wifi();
+  wifiMulti.addAP("my_WIFI_SSID_01", "MyPass01");   // add Wi-Fi networks you want to connect to
+  wifiMulti.addAP("my_WIFI_SSID_01", "MyPass02");
 
   client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(callback);
+
 
 
   ArduinoOTA.onStart([]() {
@@ -192,148 +194,62 @@ void setup() {
     else if (error == OTA_END_ERROR) Serial.println("End Failed");
   });
   ArduinoOTA.begin();
-  Serial.println("Ready");
-  Serial.print("IPess: ");
+  //Serial.println("Ready");
+  //Serial.print("IPess: ");
+  //Serial.println(WiFi.localIP());
+  Serial.println("Connecting ...");
+  int i = 0;
+  while (wifiMulti.run() != WL_CONNECTED) { // Wait for the Wi-Fi to connect: scan for Wi-Fi networks, and connect to the strongest of the networks above
+    delay(1000);
+    Serial.print('.');
+  }
+  Serial.println('\n');
+  Serial.print("Connected to ");
+  Serial.println(WiFi.SSID());              // Tell us what network we're connected to
+  Serial.print("IP address:\t");
   Serial.println(WiFi.localIP());
-  reconnect();
+  WiFi.macAddress(mac);
+  ChipID = String(mac[3], HEX) + String(mac[4], HEX) + String(mac[5], HEX);
+  ChipID.toUpperCase();
+
+  light_state_topic = "esp8266/" + ChipID;
+  Serial.println("MQTT RX Topic:" + light_state_topic);
+
+  //ToDo: reconnect() needed?
+  //reconnect();
+
+  server.on("/", handleRoot);               // Call the 'handleRoot' function when a client requests URI "/"
+  server.onNotFound(handleNotFound);        // When a client requests an unknown URI (i.e. something other than "/"), call function "handleNotFound"
+
+  server.begin();                           // Actually start the server
+  Serial.println("HTTP server started");
+  
+  MDNS_String = "esp8266_" + ChipID;
+  char MDNS_client_ID [MDNS_String.length() + 1];
+  MDNS_String.toCharArray(MDNS_client_ID, MDNS_String.length() + 1);
+  if (!MDNS.begin(MDNS_client_ID)) {             // Start the mDNS responder for esp8266.local
+     Serial.println("Error setting up MDNS responder!");
+  }
+  else{
+  Serial.println("mDNS responder started");
+  }
+  
+  //TaskScheduler stuff
+  runner.init();
+  Serial.println("Initialized scheduler");
+  runner.addTask(t_readDHT);
+  Serial.println("added t_readDHT");
+  
+  runner.addTask(t_checkNewValues);
+  Serial.println("added t_checkNewValues");
+  
+  t_readDHT.enable();
+  Serial.println("Enabled t_readDHT");
+  t_checkNewValues.enable();
+  Serial.println("Enabled t_checkNewValues");
 }
 
 
-
-
-/********************************** START SETUP WIFI*****************************************/
-void setup_wifi() {
-
-  delay(10);
-  Serial.println();
-  Serial.print("Connecting to ");
-  Serial.println(wifi_ssid);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifi_ssid, wifi_password);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
-  Serial.println(WiFi.localIP());
-}
-
-
-
-/********************************** START CALLBACK*****************************************/
-void callback(char* topic, byte* payload, unsigned int length) {
-  Serial.print("Message arrived [");
-  Serial.print(topic);
-  Serial.print("] ");
-
-  char message[length + 1];
-  for (int i = 0; i < length; i++) {
-    message[i] = (char)payload[i];
-  }
-  message[length] = '\0';
-  Serial.println(message);
-
-  if (!processJson(message)) {
-    return;
-  }
-
-  if (stateOn) {
-    // Update lights
-    realRed = map(red, 0, 255, 0, brightness);
-    realGreen = map(green, 0, 255, 0, brightness);
-    realBlue = map(blue, 0, 255, 0, brightness);
-  }
-  else {
-    realRed = 0;
-    realGreen = 0;
-    realBlue = 0;
-  }
-
-  startFade = true;
-  inFade = false; // Kill the current fade
-
-  sendState();
-}
-
-
-
-/********************************** START PROCESS JSON*****************************************/
-bool processJson(char* message) {
-  StaticJsonBuffer<BUFFER_SIZE> jsonBuffer;
-
-  JsonObject& root = jsonBuffer.parseObject(message);
-
-  if (!root.success()) {
-    Serial.println("parseObject() failed");
-    return false;
-  }
-
-  if (root.containsKey("state")) {
-    if (strcmp(root["state"], on_cmd) == 0) {
-      stateOn = true;
-    }
-    else if (strcmp(root["state"], off_cmd) == 0) {
-      stateOn = false;
-    }
-  }
-
-  // If "flash" is included, treat RGB and brightness differently
-  if (root.containsKey("flash")) {
-    flashLength = (int)root["flash"] * 1000;
-
-    if (root.containsKey("brightness")) {
-      flashBrightness = root["brightness"];
-    }
-    else {
-      flashBrightness = brightness;
-    }
-
-    if (root.containsKey("color")) {
-      flashRed = root["color"]["r"];
-      flashGreen = root["color"]["g"];
-      flashBlue = root["color"]["b"];
-    }
-    else {
-      flashRed = red;
-      flashGreen = green;
-      flashBlue = blue;
-    }
-
-    flashRed = map(flashRed, 0, 255, 0, flashBrightness);
-    flashGreen = map(flashGreen, 0, 255, 0, flashBrightness);
-    flashBlue = map(flashBlue, 0, 255, 0, flashBrightness);
-
-    flash = true;
-    startFlash = true;
-  }
-  else { // Not flashing
-    flash = false;
-
-    if (root.containsKey("color")) {
-      red = root["color"]["r"];
-      green = root["color"]["g"];
-      blue = root["color"]["b"];
-    }
-
-    if (root.containsKey("brightness")) {
-      brightness = root["brightness"];
-    }
-
-    if (root.containsKey("transition")) {
-      transitionTime = root["transition"];
-    }
-    else {
-      transitionTime = 0;
-    }
-  }
-
-  return true;
-}
 
 
 
@@ -343,58 +259,64 @@ void sendState() {
 
   JsonObject& root = jsonBuffer.createObject();
 
-  root["state"] = (stateOn) ? on_cmd : off_cmd;
-  JsonObject& color = root.createNestedObject("color");
-  color["r"] = red;
-  color["g"] = green;
-  color["b"] = blue;
 
 
-  root["brightness"] = brightness;
+
   root["humidity"] = (String)humValue;
-  root["motion"] = (String)motionStatus;
+  root["humidity_kalman"] = (String)humValue_Kalman;
   root["ldr"] = (String)LDR;
   root["temperature"] = (String)tempValue;
-  root["heatIndex"] = (String)dht.computeHeatIndex(tempValue, humValue, IsFahrenheit);
+
 
 
   char buffer[root.measureLength() + 1];
+  char __light_state_topic[light_state_topic.length() + 1];
   root.printTo(buffer, sizeof(buffer));
 
   Serial.println(buffer);
-  client.publish(light_state_topic, buffer, true);
+
+  // convert String to const char
+  //https://pubsubclient.knolleary.net/api.html#loop
+
+  light_state_topic.toCharArray(__light_state_topic, light_state_topic.length() + 1);
+
+
+  if (!client.connected()) {
+    //https://pubsubclient.knolleary.net/api.html#loop
+    Serial.print("MQTT state:");
+    Serial.println(client.state());
+    Serial.print("WiFi status:");
+    Serial.println(WiFi.status());
+    //WiFi.printDiag(Serial);
+    reconnect();
+    Serial.print("WiFi status:");
+    Serial.println(WiFi.status());
+    // software_Reset();
+  }
+  else {
+    Serial.println("Still connected! :)");
+  }
+
+  client.publish(__light_state_topic, buffer, true);
 }
 
 
-
-/********************************** START SET COLOR *****************************************/
-void setColor(int inR, int inG, int inB) {
-  analogWrite(redPin, inR);
-  analogWrite(greenPin, inG);
-  analogWrite(bluePin, inB);
-
-  Serial.println("Setting LEDs:");
-  Serial.print("r: ");
-  Serial.print(inR);
-  Serial.print(", g: ");
-  Serial.print(inG);
-  Serial.print(", b: ");
-  Serial.println(inB);
-}
 
 
 
 /********************************** START RECONNECT*****************************************/
 void reconnect() {
+  char MQTT_client_ID [light_state_topic.length() + 1];
+  light_state_topic.toCharArray(MQTT_client_ID, light_state_topic.length() + 1);
   // Loop until we're reconnected
   while (!client.connected()) {
     Serial.print("Attempting MQTT connection...");
     // Attempt to connect
-    if (client.connect(SENSORNAME, mqtt_user, mqtt_password)) {
+    if (client.connect(MQTT_client_ID, mqtt_user, mqtt_password)) {
       Serial.println("connected");
-      client.subscribe(light_set_topic);
-      setColor(0, 0, 0);
-      sendState();
+      //client.subscribe(light_set_topic);
+      //setColor(0, 0, 0);
+      //sendState();
     } else {
       Serial.print("failed, rc=");
       Serial.print(client.state());
@@ -415,196 +337,131 @@ bool checkBoundSensor(float newValue, float prevValue, float maxDiff) {
 
 /********************************** START MAIN LOOP***************************************/
 void loop() {
+  
+  
 
   ArduinoOTA.handle();
-  
-  if (!client.connected()) {
-    // reconnect();
-    software_Reset();
+
+
+
+
+
+
+  // wifi
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiMulti.run() == WL_CONNECTED) {
+      Serial.println("Wifi connected");
+    }
   }
+
+  // loop for the MQTT client
   client.loop();
 
-  if (!inFade) {
 
-    float newTempValue = dht.readTemperature(IsFahrenheit);
-    float newHumValue = dht.readHumidity();
-
-    //PIR CODE
-    pirValue = digitalRead(PIRPIN); //read state of the
-
-    if (pirValue == LOW && pirStatus != 1) {
-      motionStatus = "standby";
-      sendState();
-      pirStatus = 1;
-    }
-
-    else if (pirValue == HIGH && pirStatus != 2) {
-      motionStatus = "motion detected";
-      sendState();
-      pirStatus = 2;
-    }
-
-    delay(100);
-
-    if (checkBoundSensor(newTempValue, tempValue, diffTEMP)) {
-      tempValue = newTempValue;
-      sendState();
-    }
-
-    if (checkBoundSensor(newHumValue, humValue, diffHUM)) {
-      humValue = newHumValue;
-      sendState();
-    }
+  //readDHT();
+  //checkNewValues();
+  runner.execute();
 
 
-    int newLDR = analogRead(LDRPIN);
+  server.handleClient();                    // Listen for HTTP requests from clients
 
-    if (checkBoundSensor(newLDR, LDR, diffLDR)) {
-      LDR = newLDR;
-      sendState();
-    }
+  //yield();
+  //delay(2500);
 
-  }
-
-  if (flash) {
-    if (startFlash) {
-      startFlash = false;
-      flashStartTime = millis();
-    }
-
-    if ((millis() - flashStartTime) <= flashLength) {
-      if ((millis() - flashStartTime) % 1000 <= 500) {
-        setColor(flashRed, flashGreen, flashBlue);
-      }
-      else {
-        setColor(0, 0, 0);
-        // If you'd prefer the flashing to happen "on top of"
-        // the current color, uncomment the next line.
-        // setColor(realRed, realGreen, realBlue);
-      }
-    }
-    else {
-      flash = false;
-      setColor(realRed, realGreen, realBlue);
-    }
-  }
-
-  if (startFade) {
-    // If we don't want to fade, skip it.
-    if (transitionTime == 0) {
-      setColor(realRed, realGreen, realBlue);
-
-      redVal = realRed;
-      grnVal = realGreen;
-      bluVal = realBlue;
-
-      startFade = false;
-    }
-    else {
-      loopCount = 0;
-      stepR = calculateStep(redVal, realRed);
-      stepG = calculateStep(grnVal, realGreen);
-      stepB = calculateStep(bluVal, realBlue);
-
-      inFade = true;
-    }
-  }
-
-  if (inFade) {
-    startFade = false;
-    unsigned long now = millis();
-    if (now - lastLoop > transitionTime) {
-      if (loopCount <= 1020) {
-        lastLoop = now;
-
-        redVal = calculateVal(stepR, redVal, loopCount);
-        grnVal = calculateVal(stepG, grnVal, loopCount);
-        bluVal = calculateVal(stepB, bluVal, loopCount);
-
-        setColor(redVal, grnVal, bluVal); // Write current values to LED pins
-
-        Serial.print("Loop count: ");
-        Serial.println(loopCount);
-        loopCount++;
-      }
-      else {
-        inFade = false;
-      }
-    }
-  }
-}
-
-
-
-
-/**************************** START TRANSITION FADER *****************************************/
-// From https://www.arduino.cc/en/Tutorial/ColorCrossfader
-/* BELOW THIS LINE IS THE MATH -- YOU SHOULDN'T NEED TO CHANGE THIS FOR THE BASICS
-
-  The program works like this:
-  Imagine a crossfade that moves the red LED from 0-10,
-    the green from 0-5, and the blue from 10 to 7, in
-    ten steps.
-    We'd want to count the 10 steps and increase or
-    decrease color values in evenly stepped increments.
-    Imagine a + indicates raising a value by 1, and a -
-    equals lowering it. Our 10 step fade would look like:
-
-    1 2 3 4 5 6 7 8 9 10
-  R + + + + + + + + + +
-  G   +   +   +   +   +
-  B     -     -     -
-
-  The red rises from 0 to 10 in ten steps, the green from
-  0-5 in 5 steps, and the blue falls from 10 to 7 in three steps.
-
-  In the real program, the color percentages are converted to
-  0-255 values, and there are 1020 steps (255*4).
-
-  To figure out how big a step there should be between one up- or
-  down-tick of one of the LED values, we call calculateStep(),
-  which calculates the absolute gap between the start and end values,
-  and then divides that gap by 1020 to determine the size of the step
-  between adjustments in the value.
-*/
-int calculateStep(int prevValue, int endValue) {
-  int step = endValue - prevValue; // What's the overall gap?
-  if (step) {                      // If its non-zero,
-    step = 1020 / step;          //   divide by 1020
-  }
-
-  return step;
-}
-
-/* The next function is calculateVal. When the loop value, i,
-   reaches the step size appropriate for one of the
-   colors, it increases or decreases the value of that color by 1.
-   (R, G, and B are each calculated separately.)
-*/
-int calculateVal(int step, int val, int i) {
-  if ((step) && i % step == 0) { // If step is non-zero and its time to change a value,
-    if (step > 0) {              //   increment the value if step is positive...
-      val += 1;
-    }
-    else if (step < 0) {         //   ...or decrement it if step is negative
-      val -= 1;
-    }
-  }
-
-  // Defensive driving: make sure val stays in the range 0-255
-  if (val > 255) {
-    val = 255;
-  }
-  else if (val < 0) {
-    val = 0;
-  }
-
-  return val;
 }
 
 /****reset***/
 void software_Reset() // Restarts program from beginning but does not reset the peripherals and registers
 {
-Serial.print("resetting");
-ESP.reset(); 
+  Serial.print("resetting");
+  ESP.reset();
+}
+
+
+void handleRoot() {
+  String HTML_String;
+
+  HTML_String = "ESP: " + ChipID + "\n" + "Temperature: " + newTempValue + "\n"
+                + "Humidity: " + newHumValue + "\n" + "Humidity Kalman: " + humValue_Kalman + "\n";
+  server.send(200, "text/plain", HTML_String);   // Send HTTP status 200 (Ok) and send some text to the browser/client
+}
+
+void handleNotFound() {
+  server.send(404, "text/plain", "404: Not found"); // Send HTTP status 404 (Not Found) when there's no handler for the URI in the request
+}
+
+void checkNewValues(){
+	Serial.println("Checking for new values");
+  digitalWrite(LED_BUILTIN, HIGH); //turn the LED off
+	SendMQTT = false;
+	if (DHT22_read_OK) {
+
+    // check temperature
+    if (checkBoundSensor(newTempValue, tempValue, diffTEMP)) {
+      tempValue = newTempValue;
+      SendMQTT = true;
+      digitalWrite(LED_BUILTIN, LOW);
+    }
+
+    // check humidity
+    if (checkBoundSensor(newHumValue, humValue, diffHUM)) {
+      humValue = newHumValue;
+      SendMQTT = true;
+      digitalWrite(LED_BUILTIN, LOW);
+    }
+    int newLDR = analogRead(LDRPIN);
+
+    if (checkBoundSensor(newLDR, LDR, diffLDR)) {
+      LDR = newLDR;
+      SendMQTT = true;
+    }
+    // check Kalman filter humidity value
+    newHumValue_Kalman = myFilter.getFilteredValue(newHumValue);
+    if (checkBoundSensor(newHumValue_Kalman, humValue_Kalman, diffHUM)) {
+      humValue_Kalman = newHumValue_Kalman;
+      SendMQTT = true;
+    }
+
+    if (SendMQTT || (SendCounter >= 120)) {
+      sendState();
+      SendCounter = 0;
+    }
+    else {
+      SendCounter++;
+      Serial.println(SendCounter);
+    }
+    // increase the SendCounter even there is DHT22 read error
+  }
+  else {
+    SendCounter++;
+    Serial.println(SendCounter);
+  } 
+}
+
+void readDHT() {
+  Serial.println("Reading the temperature");
+
+  // Get temperature event and print its value.
+  sensors_event_t event;
+  bool Error_Flag = true;
+  // DHT22 temperature reading
+  dht.temperature().getEvent(&event);
+  if (isnan(event.temperature)) {
+    Serial.println("Error reading temperature!");
+    Error_Flag = false;
+  }
+  else {
+    newTempValue = event.temperature; //to use celsius remove the true
+  }
+
+  // DHT22 humidity reading
+  dht.humidity().getEvent(&event);
+  if (isnan(event.relative_humidity)) {
+    Serial.println("Error reading humidity!");
+    Error_Flag = false;
+  }
+  else {
+    newHumValue = event.relative_humidity;
+  }
+  DHT22_read_OK = Error_Flag;
 }

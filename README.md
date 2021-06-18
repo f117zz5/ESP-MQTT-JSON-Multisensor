@@ -1,3 +1,15 @@
+# My modifications
+-   Removed the photoresistor part, I do not need it
+-   Removed the RGB led, I do not need it
+-   Using TaskScheduler to handle my task management
+-   Using multi WiFi Hotspot to fit the needs of my house
+-   The MQTT names of the nodes are generated based on hte MAC address - I can use multiple nodes without managing the names in the code
+-   Added a simple web interface
+-   Using Kalman filter for the humidity measurements, my DHT22 are quite noisy 
+-   Blinking the onboard LED of the NodeMCU V2 to indicate new measurement being transmitted
+
+Below is the original documentation, I am not changing it for now. 
+
 # ESP MQTT JSON Multisensor
 
 This project shows a super easy way to get started with your own DIY Multisensor to use with [Home Assistant](https://home-assistant.io/), a sick, open-source Home Automation platform that can do just about anything. 
